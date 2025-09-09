@@ -43,84 +43,86 @@ const fragmentShader = `
         vec4 texColor = texture2D(uTexture, vUv);
 
         if (uCleanPixels) {
-            // STEP 1: Edge-aware stray pixel removal.
-            // This algorithm identifies pixels that are "outside" the main character body
-            // by checking for a connection to the transparent background.
-            
             float originalAlpha = texColor.a;
-            float finalAlpha = originalAlpha;
 
-            if (originalAlpha > 0.1) {
-                // Check if a pixel is connected to the border (i.e., is "outside").
-                // We trace paths to the image borders. If a path of mostly transparent pixels exists,
-                // we consider this pixel to be outside.
-                const int steps = 15; // How far to look for a connection to the border.
-                const float alpha_threshold = 0.1;
-
-                vec2 to_left = vec2(-1.0, 0.0) * onePixel;
-                vec2 to_right = vec2(1.0, 0.0) * onePixel;
-                vec2 to_up = vec2(0.0, 1.0) * onePixel;
-                vec2 to_down = vec2(0.0, -1.0) * onePixel;
-
-                float path_clarity[4];
-                path_clarity[0] = 1.0; // left
-                path_clarity[1] = 1.0; // right
-                path_clarity[2] = 1.0; // up
-                path_clarity[3] = 1.0; // down
-
-                for (int i = 1; i <= steps; i++) {
-                    path_clarity[0] *= (1.0 - getAlpha(vUv + to_left * float(i)));
-                    path_clarity[1] *= (1.0 - getAlpha(vUv + to_right * float(i)));
-                    path_clarity[2] *= (1.0 - getAlpha(vUv + to_up * float(i)));
-                    path_clarity[3] *= (1.0 - getAlpha(vUv + to_down * float(i)));
-                }
-                
-                // If any path is mostly clear (product of (1-alpha) is high), it's likely outside.
-                float outside_metric = max(max(path_clarity[0], path_clarity[1]), max(path_clarity[2], path_clarity[3]));
-
-                if (outside_metric > 0.9) { // High confidence that it's connected to outside
-                    finalAlpha = 0.0;
+            // STEP 1: Remove stray pixels outside the main body.
+            // This is a form of morphological opening. If a pixel is opaque but
+            // its neighbors are mostly transparent, we remove it.
+            float neighborAlphaSum = 0.0;
+            const int radius = 2; // Check a 5x5 area
+            for (int i = -radius; i <= radius; i++) {
+                for (int j = -radius; j <= radius; j++) {
+                    if (i == 0 && j == 0) continue;
+                    neighborAlphaSum += getAlpha(vUv + vec2(float(i), float(j)) * onePixel);
                 }
             }
+            float neighborCount = float((radius*2+1)*(radius*2+1) - 1);
+            float avgNeighborAlpha = neighborAlphaSum / neighborCount;
 
-            // Apply the cleaned alpha mask
-            texColor.a = finalAlpha;
-            
-            // STEP 2: Clean up internal stray pixels (holes) using the new clean mask
-            if (texColor.a > 0.5) {
-                // If the pixel itself is transparent in the original, it could be a hole.
-                if (originalAlpha < 0.5) { 
+            // If the pixel is opaque but its neighborhood is very sparse, it's a stray pixel.
+            if (originalAlpha > 0.8 && avgNeighborAlpha < 0.1) {
+                texColor.a = 0.0;
+            }
+
+            // STEP 2: Fill internal holes.
+            // If a pixel is transparent but its neighbors are mostly opaque, it's a hole.
+            if (texColor.a < 0.2) { // Use the potentially cleaned alpha
+                // Recalculate average using original alpha values for hole detection
+                float originalNeighborAlphaSum = 0.0;
+                 for (int i = -1; i <= 1; i++) { // Use a smaller 3x3 kernel for filling
+                    for (int j = -1; j <= 1; j++) {
+                        if (i == 0 && j == 0) continue;
+                        originalNeighborAlphaSum += texture2D(uTexture, vUv + vec2(float(i), float(j)) * onePixel).a;
+                    }
+                }
+                float avgOriginalNeighborAlpha = originalNeighborAlphaSum / 8.0;
+
+                if (avgOriginalNeighborAlpha > 0.8) {
+                    // This is a hole. Fill it with the dominant color of its neighbors.
                     vec3 dominantColor = vec3(0.0);
                     float maxCount = 0.0;
-                    
-                    // Find dominant color in 3x3 neighborhood to fill holes
+                    vec3 colors[5];
+                    colors[0] = PALETTE_FACE;
+                    colors[1] = PALETTE_ARMOUR;
+                    colors[2] = PALETTE_TRIM;
+                    colors[3] = PALETTE_HAIR;
+                    colors[4] = PALETTE_OUTLINE;
+                    float counts[5];
+                    for(int c=0; c<5; c++) counts[c] = 0.0;
+
                     for (int i = -1; i <= 1; i++) {
                         for (int j = -1; j <= 1; j++) {
                             if (i == 0 && j == 0) continue;
-                            vec2 neighborUv = vUv + onePixel * vec2(float(i), float(j));
-                            vec4 neighborColor = texture2D(uTexture, neighborUv);
-                            // Only consider neighbors that are part of the character
+                            vec4 neighborColor = texture2D(uTexture, vUv + vec2(float(i), float(j)) * onePixel);
                             if (neighborColor.a > 0.5) {
-                                float currentCount = 1.0;
-                                // Check 3x3 around the neighbor to see how solid it is
-                                for (int k = -1; k <= 1; k++) {
-                                    for (int l = -1; l <= 1; l++) {
-                                         vec4 sampleColor = texture2D(uTexture, neighborUv + onePixel * vec2(float(k), float(l)));
-                                         if (sampleColor.a > 0.5 && distance(neighborColor.rgb, sampleColor.rgb) < 0.1) {
-                                             currentCount += 1.0;
-                                         }
+                                float min_dist = 10.0;
+                                int min_idx = -1;
+                                for(int c=0; c<5; c++) {
+                                    float d = distance(neighborColor.rgb, colors[c]);
+                                    if(d < min_dist) {
+                                        min_dist = d;
+                                        min_idx = c;
                                     }
                                 }
-                                if (currentCount > maxCount) {
-                                    maxCount = currentCount;
-                                    dominantColor = neighborColor.rgb;
+                                if(min_idx != -1) {
+                                    counts[min_idx] += 1.0;
                                 }
                             }
                         }
                     }
-                     // Only overwrite if a dominant color was found
-                    if (maxCount > 1.0) { // Require at least one solid neighbor
-                        texColor.rgb = dominantColor;
+                    
+                    int dominant_idx = -1;
+                    float max_c = 0.0;
+                     for(int c=0; c<5; c++) {
+                        if(counts[c] > max_c) {
+                            max_c = counts[c];
+                            dominant_idx = c;
+                        }
+                    }
+
+                    if (dominant_idx != -1) {
+                        texColor.rgb = colors[dominant_idx];
+                        texColor.a = 1.0;
                     }
                 }
             }
